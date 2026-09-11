@@ -1,0 +1,22 @@
+{
+  "solver_status": "Optimization terminated successfully. (HiGHS Status 7: Optimal)",
+  "binary_model": true,
+  "periods": 144,
+  "optimized_grid_energy_kWh": 59482.698974698236,
+  "optimized_grid_cost_yuan": 35126.94859928963,
+  "no_storage_grid_energy_kWh": 61789.9354,
+  "no_storage_grid_cost_yuan": 48052.046590846665,
+  "cost_saving_yuan": 12925.097991557035,
+  "cost_saving_percent": 26.89812174205939,
+  "charge_energy_kWh": 20740.666007183696,
+  "discharge_energy_kWh": 16799.93946581879,
+  "curtailment_kWh": 0.0,
+  "end_soc_kWh": 6000.0,
+  "min_soc_kWh": 1200.0,
+  "max_soc_kWh": 10800.0,
+  "max_balance_residual_kWh": 2.2737367544323206e-13,
+  "max_soc_residual_kWh": 8.313350008393172e-13,
+  "simultaneous_charge_discharge_periods": 0,
+  "solve_seconds": 0.06465929999831133,
+  "stage1_optimal_cost_yuan": 35126.94858928963
+}

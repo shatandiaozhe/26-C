@@ -1,0 +1,15 @@
+# Microsoft Office temporary lock files
+~$*
+
+# Local runtime caches and generated intermediates
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+.tools/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+/working/qa_preprocessing/

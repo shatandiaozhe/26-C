@@ -1,0 +1,13 @@
+原文件 R5 第3列 = ''
+R5 | 合格 | working/附件结构审计.json；results/复现清单.json | 简述len=74 | 整改len=36
+R6 | 待核实 | docs/三_模型选择阶段.md 末尾候选文献 | 简述len=54 | 整改len=29
+R7 | 合格 | docs/七_结果分析阶段.md 对照 results/问题1_结果摘要.jso | 简述len=72 | 整改len=26
+R8 | 合格 | docs/七_结果分析阶段.md 与 问题二至四_模型检验.md 结论段 | 简述len=40 | 整改len=28
+R9 | 合格 | C题.pdf 对照 问题1_求解说明.md、问题2至4_求解说明.md | 简述len=56 | 整改len=30
+R10 | 存在问题 | 模型假设.md 第5条；q234_solve.py 第334/442/474/4 | 简述len=72 | 整改len=42
+R11 | 合格 | results/result1–4-3.xlsx；问题2至4_求解说明.md | 简述len=47 | 整改len=30
+R12 | 合格 | docs/三_模型选择阶段.md、docs/七_结果分析阶段.md | 简述len=60 | 整改len=29
+R13 | 合格（并网容量待说明） | q234_solve.py 的 _dispatch_milp；问题2至4_求解说明. | 简述len=86 | 整改len=45
+R14 | 合格 | results/问题1_结果摘要.json、results/问题2至4_运行摘要 | 简述len=64 | 整改len=16
+R15 | 合格 | problem1_solve.py、q234_solve.py | 简述len=71 | 整改len=25
+R16 | 存在问题 | q234_solve.py 参数；docs/七_结果分析阶段.md 7.6 | 简述len=64 | 整改len=32
