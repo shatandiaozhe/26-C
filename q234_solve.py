@@ -969,9 +969,24 @@ def make_figures(all_frame: pd.DataFrame, daily: pd.DataFrame, voi_daily: pd.Dat
     return paths
 
 
-def write_notes(p: Parameters, summaries: pd.DataFrame, checks: dict, voi_value: float | None) -> Path:
+def write_notes(
+    p: Parameters,
+    frame: pd.DataFrame,
+    summaries: pd.DataFrame,
+    checks: dict,
+    voi_value: float | None,
+) -> Path:
     totals = summaries[summaries["日期"] >= pd.Timestamp("2025-02-01")].groupby("策略").sum(numeric_only=True)
     dynamic_cfg = DynamicQuantileParameters()
+    evaluation = frame[frame["日期"] >= pd.Timestamp("2025-02-01")]
+    quantile_stats: dict[str, tuple[float, float, int]] = {}
+    for name in ("问题2_固定价", "问题4-2_波动价"):
+        selected = evaluation[evaluation["策略"] == name].groupby("日期")["选择净负荷分位数"].first()
+        quantile_stats[name] = (
+            float(selected.mean()),
+            float(selected.median()),
+            int(selected.ne(selected.shift()).sum() - 1),
+        )
     lines = [
         "# 问题2至问题4代码求解说明",
         "",
@@ -993,7 +1008,10 @@ def write_notes(p: Parameters, summaries: pd.DataFrame, checks: dict, voi_value:
         "## 关键口径",
         "",
         f"- 单程充、放电效率均为 {p.eta_charge:.2f}，往返效率为 {p.eta_charge*p.eta_discharge:.2%}。",
-        f"- 问题2与问题4-2直接预测净负荷，候选分位数为 {dynamic_cfg.candidates[0]:.2f}—{dynamic_cfg.candidates[-1]:.2f}，按 {dynamic_cfg.validation_days} 天历史验证窗滚动选择。",
+        f"- 问题2与问题4-2直接预测净负荷：训练窗口 {dynamic_cfg.training_days} 天、相似日 {dynamic_cfg.similar_days} 个、验证窗口 {dynamic_cfg.validation_days} 天。",
+        f"- 候选分位数为 {dynamic_cfg.candidates[0]:.2f}—{dynamic_cfg.candidates[-1]:.2f}、步长 {dynamic_cfg.candidates[1]-dynamic_cfg.candidates[0]:.2f}；条件风险价值置信水平 {dynamic_cfg.cvar_level:.2f}、风险权重 {dynamic_cfg.risk_weight:.2f}、稳定权重 {dynamic_cfg.stability_weight:.2f}、初始分位数 {dynamic_cfg.default_alpha:.2f}。",
+        "- 负荷与光伏按同一历史日配对后直接构造净负荷，避免分别取边际分位数造成双重保守；候选参数按已实现历史日的运行成本而非单一预测误差选择。",
+        "- 动态净负荷分位数只覆盖问题2固定价和问题4-2波动价；问题3和问题4-3使用附件3的0/6/12/18时点光伏预报滚动求解。",
         "- 第三问下调后不再支付被取消电量的原价，但支付其50%违约费；因此总成本为 `原计划费 + 1.5p×上调量 - 0.5p×下调量 + 5p×紧急购电量`。",
         "- 问题4假定当日144点电价在0:00已知。若赛题解释为实时才可见，应替换为只使用历史数据的价格预测。",
         "- 逐时段二元状态变量与有限功率上界严格禁止同时充放电。",
@@ -1008,9 +1026,27 @@ def write_notes(p: Parameters, summaries: pd.DataFrame, checks: dict, voi_value:
     ]
     for name, row in totals.iterrows():
         lines.append(f"| {name} | {row['总成本_元']:.2f} | {row['计划购电量_kWh']:.2f} | {row['调整后购电量_kWh']:.2f} | {row['紧急购电量_kWh']:.2f} |")
+    fixed_saving = totals.loc["问题2_固定价", "总成本_元"] - totals.loc["问题3_固定价", "总成本_元"]
+    variable_saving = totals.loc["问题4-2_波动价", "总成本_元"] - totals.loc["问题4-3_波动价", "总成本_元"]
+    lines += [
+        "", "## 动态选参统计与经济比较", "",
+        f"- 问题2所选分位数均值 {quantile_stats['问题2_固定价'][0]:.3f}、中位数 {quantile_stats['问题2_固定价'][1]:.2f}、变更 {quantile_stats['问题2_固定价'][2]} 次。",
+        f"- 问题4-2所选分位数均值 {quantile_stats['问题4-2_波动价'][0]:.3f}、中位数 {quantile_stats['问题4-2_波动价'][1]:.2f}、变更 {quantile_stats['问题4-2_波动价'][2]} 次。",
+        f"- 问题3相对问题2节省 {fixed_saving:.2f} 元，降幅 {fixed_saving/totals.loc['问题2_固定价', '总成本_元']:.3%}。",
+        f"- 问题4-3相对问题4-2节省 {variable_saving:.2f} 元，降幅 {variable_saving/totals.loc['问题4-2_波动价', '总成本_元']:.3%}。",
+    ]
     lines += ["", "## 校验结果", ""]
     for name, item in checks.items():
         lines.append(f"- {name}：最大供需残差 {item['最大供需平衡残差_kWh']:.3e} kWh，最大 SOC 残差 {item['最大SOC递推残差_kWh']:.3e} kWh，同时充放电 {item['同时充放电时段数']} 个时段。")
+    lines += [
+        "- 独立五折时间顺序检验中，动态日前净负荷预测的平均选择分位数为 0.808；其点预测 RMSE 不优于周滞后基线，但分位数按运行成本选取，不能据此直接判定经济方案失效。",
+        "- 独立正负10%冻结压力检验中，日前分支平均成本增加约6.6%，滚动分支约增加12.0%至12.3%；这是后续滚动补救失效时的压力上界。",
+        "", "## 适用条件与限制", "",
+        "- 问题四假定每日0时已知当日完整价格路径；若价格只能实时获得，必须接入只使用历史信息的价格预测器后重新求解。",
+        "- 题目未提供并网购电功率上限，当前不额外设置该约束；如补充上限，应重新检查可行性。",
+        "- 当前按每日可得信息逐日前推，属于因果滚动策略，不是拥有全年未来信息的一次性联合最优。",
+        "- 上述五折与压力检验结论来自当前正式模型检验文件；模型、结果或检验口径改变后须同步重跑，不得沿用旧结论。",
+    ]
     if voi_value is not None:
         conclusion = "具有正的毛价值" if voi_value > 0 else "未显示正的毛价值"
         decision = (
@@ -1091,7 +1127,7 @@ def main() -> None:
         write_template(q43, "result4-3.xlsx", "result4-3.xlsx", adjusted=True),
     ]
     figures = make_figures(all_frame, daily, voi_daily)
-    notes = write_notes(p_global, daily, checks, voi_value)
+    notes = write_notes(p_global, all_frame, daily, checks, voi_value)
     summary_payload = {
         "parameters": asdict(p_global),
         "dynamic_quantile_parameters": asdict(DynamicQuantileParameters()),
