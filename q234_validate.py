@@ -10,8 +10,9 @@ import numpy as np
 import pandas as pd
 
 from q234_solve import (
-    Parameters, _issue_index, forecast_from_history, forecast_load_median,
-    load_inputs, official_pv_forecast, validate_schedule,
+    DynamicQuantileParameters, Parameters, _issue_index, dynamic_net_forecast,
+    dynamic_validation_cost, forecast_load_median, load_inputs,
+    official_pv_forecast, select_dynamic_quantile, validate_schedule,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -39,16 +40,34 @@ def prediction_validation(data, p: Parameters) -> pd.DataFrame:
     """按日期连续分成五折；每一天的预测只调用此前历史。"""
     days = np.arange(31, 365)  # 一月仅作热启动，二月至十二月样本外评价
     folds = np.array_split(days, 5)
+    cfg = DynamicQuantileParameters()
+    history = {alpha: [] for alpha in cfg.candidates}
+    selected_alpha = cfg.default_alpha
+    dynamic_records = {}
+    for day_i in range(365):
+        selected_alpha, scores = select_dynamic_quantile(history, selected_alpha, cfg)
+        dynamic_records[day_i] = (
+            dynamic_net_forecast(data, day_i, selected_alpha, cfg),
+            selected_alpha,
+            scores.get(selected_alpha, np.nan),
+        )
+        for alpha in cfg.candidates:
+            history[alpha].append(
+                dynamic_validation_cost(data, day_i, alpha, cfg, p, "fixed")
+            )
     rows = []
     issue_ts = [_issue_index(data.time_labels, h) for h in (0, 6, 12, 18)]
     for fold_no, fold in enumerate(folds, 1):
-        actual_load, q2_load, q2_pv, actual_pv = [], [], [], []
+        actual_load, actual_pv, q2_net, actual_net = [], [], [], []
+        selected_alphas, selected_scores = [], []
         q3_load, q3_pv = [], []
         naive_load, naive_pv = [], []
         for day_i in fold:
-            lh, ph = forecast_from_history(data, day_i, p)
             actual_load.append(data.load_kwh[day_i]); actual_pv.append(data.pv_kwh[day_i])
-            q2_load.append(lh); q2_pv.append(ph)
+            net_hat, alpha, score = dynamic_records[day_i]
+            q2_net.append(net_hat)
+            actual_net.append(data.load_kwh[day_i] - data.pv_kwh[day_i])
+            selected_alphas.append(alpha); selected_scores.append(score)
             lag = day_i - 7
             naive_load.append(data.load_kwh[lag]); naive_pv.append(data.pv_kwh[lag])
             day_l, day_p = np.zeros(144), np.zeros(144)
@@ -58,12 +77,22 @@ def prediction_validation(data, p: Parameters) -> pd.DataFrame:
                 day_p[start:stop] = official_pv_forecast(data, day_i, start)[start:stop]
             q3_load.append(day_l); q3_pv.append(day_p)
         arrays = [np.concatenate(x) for x in
-                  (actual_load, actual_pv, q2_load, q2_pv, q3_load, q3_pv,
+                  (actual_load, actual_pv, q2_net, actual_net, q3_load, q3_pv,
                    naive_load, naive_pv)]
-        al, ap, l2, p2, l3, p3, nl, npv = arrays
+        al, ap, n2, an, l3, p3, nl, npv = arrays
+        naive_net = nl - npv
+        m, b = metrics(an, n2), metrics(an, naive_net)
+        rows.append({"折次": fold_no, "起始日期": str(data.dates[fold[0]].date()),
+                     "结束日期": str(data.dates[fold[-1]].date()), "问题": "问题二及问题四日前分支",
+                     "变量": "净负荷", **m, "周滞后基线RMSE_kWh": b["RMSE_kWh"],
+                     "相对基线RMSE改善_百分比": 100 * (1 - m["RMSE_kWh"] / b["RMSE_kWh"]),
+                     "平均选择分位数": float(np.mean(selected_alphas)),
+                     "分位数最小值": float(np.min(selected_alphas)),
+                     "分位数最大值": float(np.max(selected_alphas)),
+                     "平均选择得分_元": float(np.mean(selected_scores)),
+                     "Pinball损失": np.nan, "周滞后基线Pinball损失": np.nan,
+                     "相对基线Pinball改善_百分比": np.nan})
         for question, variable, truth, pred, base, quantile in [
-            ("问题二", "负荷", al, l2, nl, p.load_quantile),
-            ("问题二", "光伏", ap, p2, npv, p.pv_quantile),
             ("问题三及问题四滚动分支", "负荷", al, l3, nl, .5),
             ("问题三及问题四滚动分支", "光伏", ap, p3, npv, .5),
         ]:
@@ -72,7 +101,9 @@ def prediction_validation(data, p: Parameters) -> pd.DataFrame:
                          "结束日期": str(data.dates[fold[-1]].date()), "问题": question,
                          "变量": variable, **m, "周滞后基线RMSE_kWh": b["RMSE_kWh"],
                          "相对基线RMSE改善_百分比": 100 * (1 - m["RMSE_kWh"] / b["RMSE_kWh"]),
-                         "分位数": quantile, "Pinball损失": pinball(truth, pred, quantile),
+                         "平均选择分位数": quantile, "分位数最小值": quantile,
+                         "分位数最大值": quantile, "平均选择得分_元": np.nan,
+                         "Pinball损失": pinball(truth, pred, quantile),
                          "周滞后基线Pinball损失": pinball(truth, base, quantile),
                          "相对基线Pinball改善_百分比": 100 * (1 - pinball(truth, pred, quantile)
                                                               / pinball(truth, base, quantile))})

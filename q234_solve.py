@@ -12,7 +12,7 @@
 
 建模口径：
 1. 功率乘 1/6 h 转为每 10 分钟电量，所有平衡式统一使用 kWh。
-2. 问题 2 使用严格因果的相似日分位数预测；0:00 后不修改计划购电量。
+2. 问题 2 使用严格因果的滚动净负荷分位数预测；0:00 后不修改计划购电量。
 3. 问题 3 使用附件 3 的 0/6/12/18 点光伏预报，历史时段冻结，只重算未来时段。
 4. 下调时取消原购电但仍支付 50% 违约费，因此相对原计划成本的变化为 -0.5p×下调量；
    上调超出原计划部分按 1.5p 计费。该解释与题面“违约电价 50%”一致。
@@ -70,13 +70,25 @@ class Parameters:
     up_adjust_multiplier: float = 1.5
     down_cancel_refund_multiplier: float = 0.5
     lookback_days: int = 56
-    load_quantile: float = 0.80
-    pv_quantile: float = 0.20
     tolerance: float = 1e-6
 
     @property
     def max_interval_energy_kwh(self) -> float:
         return self.max_power_kw * self.dt_hours
+
+
+@dataclass(frozen=True)
+class DynamicQuantileParameters:
+    """正式日前策略使用的因果滚动净负荷分位数选参配置。"""
+
+    training_days: int = 60
+    validation_days: int = 14
+    similar_days: int = 20
+    candidates: tuple[float, ...] = tuple(np.round(np.arange(0.50, 0.951, 0.05), 2))
+    cvar_level: float = 0.95
+    risk_weight: float = 0.20
+    stability_weight: float = 0.02
+    default_alpha: float = 0.80
 
 
 @dataclass
@@ -106,8 +118,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="问题2至4：微网因果预测与滚动调度")
     parser.add_argument("--smoke", action="store_true", help="只计算 1 月 1 日至 2 月 3 日并做约束校验")
     parser.add_argument("--eta", type=float, default=0.90, help="单程效率，必须在 (0,1] 范围内")
-    parser.add_argument("--load-quantile", type=float, default=0.80, help="问题2负荷分位数，必须在 [0,1]")
-    parser.add_argument("--pv-quantile", type=float, default=0.20, help="问题2光伏分位数，必须在 [0,1]")
     return parser.parse_args()
 
 
@@ -196,8 +206,6 @@ def load_inputs(params: Parameters) -> InputData:
 def validate_parameters(p: Parameters) -> None:
     if not (0 < p.eta_charge <= 1 and 0 < p.eta_discharge <= 1):
         raise ValueError("参数 eta_charge、eta_discharge 需在 (0,1] 范围内调试")
-    if not (0 <= p.load_quantile <= 1 and 0 <= p.pv_quantile <= 1):
-        raise ValueError("参数 load_quantile、pv_quantile 需在 [0,1] 范围内调试")
     if p.soc_min_kwh >= p.soc_max_kwh or p.max_power_kw <= 0:
         raise ValueError("储能上下界或最大功率参数无效")
     if p.lexicographic_abs_tolerance_yuan < 0 or p.lexicographic_rel_tolerance < 0:
@@ -214,15 +222,110 @@ def causal_candidates(day_i: int, dates: pd.DatetimeIndex, lookback: int) -> np.
     return same_weekday if len(same_weekday) >= 3 else all_past
 
 
-def forecast_from_history(data: InputData, day_i: int, p: Parameters) -> tuple[np.ndarray, np.ndarray]:
-    """问题2预测：负荷取高分位、光伏取低分位，降低五倍紧急购电风险。"""
-    candidates = causal_candidates(day_i, data.dates, p.lookback_days)
-    if len(candidates) == 0:
-        return data.fallback_load_kwh.copy(), data.fallback_pv_kwh.copy()
-    # np.quantile 直接处理浮点数组，避免手写排序索引导致端点和插值偏差。
-    load_hat = np.quantile(data.load_kwh[candidates], p.load_quantile, axis=0)
-    pv_hat = np.quantile(data.pv_kwh[candidates], p.pv_quantile, axis=0)
-    return np.maximum(load_hat, 0.0), np.maximum(pv_hat, 0.0)
+def dynamic_similar_days(
+    data: InputData,
+    day_i: int,
+    cfg: DynamicQuantileParameters,
+) -> np.ndarray:
+    """只在滚动训练窗内选择过去相似日，不使用当前日及未来实际数据。"""
+    start = max(0, day_i - cfg.training_days)
+    candidates = np.arange(start, day_i, dtype=int)
+    if not len(candidates):
+        return candidates
+    weekday = data.dates[day_i].weekday()
+    same_type = candidates[data.dates[candidates].weekday == weekday]
+    pool = same_type if len(same_type) >= min(5, cfg.similar_days) else candidates
+    recent_start = max(0, day_i - 7)
+    reference = np.mean(
+        data.load_kwh[recent_start:day_i] - data.pv_kwh[recent_start:day_i], axis=0
+    )
+    net = data.load_kwh[pool] - data.pv_kwh[pool]
+    scale = max(float(np.std(net)), 1.0)
+    shape_distance = np.sqrt(np.mean(((net - reference) / scale) ** 2, axis=1))
+    recency = (day_i - pool) / max(cfg.training_days, 1)
+    score = shape_distance + 0.15 * recency
+    return pool[np.argsort(score)[: cfg.similar_days]]
+
+
+def dynamic_net_forecast(
+    data: InputData,
+    day_i: int,
+    alpha: float,
+    cfg: DynamicQuantileParameters,
+) -> np.ndarray:
+    """按候选分位数直接预测净负荷，避免拆分边际分位数造成口径错配。"""
+    indices = dynamic_similar_days(data, day_i, cfg)
+    if not len(indices):
+        return data.fallback_load_kwh - data.fallback_pv_kwh
+    paired_net = data.load_kwh[indices] - data.pv_kwh[indices]
+    return np.quantile(paired_net, alpha, axis=0)
+
+
+def _hourly_sum(values: np.ndarray) -> np.ndarray:
+    return np.asarray(values, dtype=float).reshape(24, 6).sum(axis=1)
+
+
+def dynamic_validation_cost(
+    data: InputData,
+    day_i: int,
+    alpha: float,
+    cfg: DynamicQuantileParameters,
+    p: Parameters,
+    price_mode: str,
+) -> float:
+    """用已实现历史日的一小时聚合调度成本评价候选分位数。"""
+    net_hat = _hourly_sum(dynamic_net_forecast(data, day_i, alpha, cfg))
+    price_10min = data.fixed_price if price_mode == "fixed" else data.variable_price[day_i]
+    price = np.asarray(price_10min, dtype=float).reshape(24, 6).mean(axis=1)
+    hourly_params = Parameters(
+        dt_hours=1.0,
+        capacity_kwh=p.capacity_kwh,
+        soc_min_kwh=p.soc_min_kwh,
+        soc_max_kwh=p.soc_max_kwh,
+        soc_initial_kwh=p.soc_initial_kwh,
+        max_power_kw=p.max_power_kw,
+        eta_charge=p.eta_charge,
+        eta_discharge=p.eta_discharge,
+        lexicographic_abs_tolerance_yuan=p.lexicographic_abs_tolerance_yuan,
+        lexicographic_rel_tolerance=p.lexicographic_rel_tolerance,
+        emergency_multiplier=p.emergency_multiplier,
+        up_adjust_multiplier=p.up_adjust_multiplier,
+        down_cancel_refund_multiplier=p.down_cancel_refund_multiplier,
+        tolerance=p.tolerance,
+    )
+    plan = _dispatch_milp(
+        np.maximum(net_hat, 0.0), np.maximum(-net_hat, 0.0),
+        price, p.soc_initial_kwh, p.soc_initial_kwh, hourly_params,
+    )
+    actual_net = _hourly_sum(data.load_kwh[day_i] - data.pv_kwh[day_i])
+    balance = plan.grid + plan.discharge - plan.charge - actual_net
+    emergency = np.maximum(-balance, 0.0)
+    return float(np.sum(price * plan.grid + p.emergency_multiplier * price * emergency))
+
+
+def _empirical_cvar(costs: np.ndarray, level: float) -> float:
+    count = max(1, int(np.ceil((1.0 - level) * len(costs))))
+    return float(np.mean(np.sort(costs)[-count:]))
+
+
+def select_dynamic_quantile(
+    history: dict[float, list[float]],
+    previous_alpha: float,
+    cfg: DynamicQuantileParameters,
+) -> tuple[float, dict[float, float]]:
+    """按近期平均成本、尾部成本和切换惩罚选择下一日净负荷分位数。"""
+    scores: dict[float, float] = {}
+    for alpha in cfg.candidates:
+        costs = np.asarray(history[alpha][-cfg.validation_days:], dtype=float)
+        if len(costs) < cfg.validation_days:
+            scores[alpha] = np.inf
+            continue
+        mean_cost = float(np.mean(costs))
+        risk_cost = _empirical_cvar(costs, cfg.cvar_level)
+        stability = cfg.stability_weight * mean_cost * abs(alpha - previous_alpha) / 0.05
+        scores[alpha] = mean_cost + cfg.risk_weight * risk_cost + stability
+    finite = {alpha: score for alpha, score in scores.items() if np.isfinite(score)}
+    return (min(finite, key=finite.get) if finite else cfg.default_alpha), scores
 
 
 def forecast_load_median(data: InputData, day_i: int, p: Parameters, issue_t: int) -> np.ndarray:
@@ -485,13 +588,19 @@ def solve_day_ahead(
     price_mode: str,
     stop_day: int,
 ) -> pd.DataFrame:
-    """问题2/4-2：每天 0:00 预测并一次制定全天计划。"""
+    """问题2/4-2：每天滚动选取净负荷分位数，再制定全天计划。"""
     strategy = "问题2_固定价" if price_mode == "fixed" else "问题4-2_波动价"
+    cfg = DynamicQuantileParameters()
+    history = {alpha: [] for alpha in cfg.candidates}
+    selected_alpha = cfg.default_alpha
     rows: list[pd.DataFrame] = []
     soc = p.soc_initial_kwh
     for day_i in range(stop_day):
         price = data.fixed_price if price_mode == "fixed" else data.variable_price[day_i]
-        load_hat, pv_hat = forecast_from_history(data, day_i, p)
+        selected_alpha, scores = select_dynamic_quantile(history, selected_alpha, cfg)
+        net_hat = dynamic_net_forecast(data, day_i, selected_alpha, cfg)
+        load_hat = np.maximum(net_hat, 0.0)
+        pv_hat = np.maximum(-net_hat, 0.0)
         terminal_soc = p.soc_initial_kwh if day_i == stop_day - 1 else None
         plan = _dispatch_milp(load_hat, pv_hat, price, soc, terminal_soc, p)
         executed = execute_segment(data, day_i, 0, 144, plan.grid, plan.charge, plan.discharge, soc, p)
@@ -499,8 +608,15 @@ def solve_day_ahead(
             data, day_i, price, plan.grid, plan.grid, plan.charge, plan.discharge,
             executed["soc"], executed["emergency"], executed["spill"], soc, p, strategy,
         )
+        frame["选择净负荷分位数"] = selected_alpha
+        frame["分位数选择得分"] = scores.get(selected_alpha, np.nan)
         rows.append(frame)
         soc = float(executed["end_soc"])
+        # 当天执行结束后才加入当天反事实成本，确保次日选参严格因果。
+        for alpha in cfg.candidates:
+            history[alpha].append(
+                dynamic_validation_cost(data, day_i, alpha, cfg, p, price_mode)
+            )
     return pd.concat(rows, ignore_index=True)
 
 
@@ -855,6 +971,7 @@ def make_figures(all_frame: pd.DataFrame, daily: pd.DataFrame, voi_daily: pd.Dat
 
 def write_notes(p: Parameters, summaries: pd.DataFrame, checks: dict, voi_value: float | None) -> Path:
     totals = summaries[summaries["日期"] >= pd.Timestamp("2025-02-01")].groupby("策略").sum(numeric_only=True)
+    dynamic_cfg = DynamicQuantileParameters()
     lines = [
         "# 问题2至问题4代码求解说明",
         "",
@@ -869,14 +986,14 @@ def write_notes(p: Parameters, summaries: pd.DataFrame, checks: dict, voi_value:
         "## 统一求解步骤",
         "",
         "1. 数据输入：读取附件1至附件4，逐一核对日期、144个时段和非负数值。注意：kW 必须乘 `1/6 h` 才能得到 kWh。",
-        "2. 参数初始化：设置 SOC 范围、功率上限、效率、五倍紧急电价和预测分位数。注意：效率必须在 `(0,1]`，分位数参数必须在 `[0,1]`。",
-        "3. 模型调用：问题2调用因果相似日分位数预测与日前混合整数规划；问题3在0/6/12/18点重算未来时段；问题4替换为附件4波动电价。注意：历史时段不得重算。",
+        "2. 参数初始化：设置 SOC 范围、功率上限、效率、五倍紧急电价和动态净负荷分位数候选集。注意：效率必须在 `(0,1]`，候选分位数必须在 `[0,1]`。",
+        "3. 模型调用：问题2按近期样本外运行成本滚动选择净负荷分位数并求解日前混合整数规划；问题3在0/6/12/18点重算未来时段；问题4替换为附件4波动电价。注意：历史时段不得重算。",
         "4. 结果输出：回代供需平衡、SOC递推、边界、互斥和成本，再填写官方模板并生成图表。注意：不得只根据求解器 success 判断结果正确。",
         "",
         "## 关键口径",
         "",
         f"- 单程充、放电效率均为 {p.eta_charge:.2f}，往返效率为 {p.eta_charge*p.eta_discharge:.2%}。",
-        f"- 问题2负荷使用 {p.load_quantile:.2f} 分位数、光伏使用 {p.pv_quantile:.2f} 分位数。参数需在滚动样本外结果上调试。",
+        f"- 问题2与问题4-2直接预测净负荷，候选分位数为 {dynamic_cfg.candidates[0]:.2f}—{dynamic_cfg.candidates[-1]:.2f}，按 {dynamic_cfg.validation_days} 天历史验证窗滚动选择。",
         "- 第三问下调后不再支付被取消电量的原价，但支付其50%违约费；因此总成本为 `原计划费 + 1.5p×上调量 - 0.5p×下调量 + 5p×紧急购电量`。",
         "- 问题4假定当日144点电价在0:00已知。若赛题解释为实时才可见，应替换为只使用历史数据的价格预测。",
         "- 逐时段二元状态变量与有限功率上界严格禁止同时充放电。",
@@ -917,8 +1034,6 @@ def main() -> None:
     p_global = Parameters(
         eta_charge=args.eta,
         eta_discharge=args.eta,
-        load_quantile=args.load_quantile,
-        pv_quantile=args.pv_quantile,
     )
     validate_parameters(p_global)
     data = load_inputs(p_global)
@@ -948,7 +1063,13 @@ def main() -> None:
         voi_value = float(base_cost - dense_cost)
 
     print("[1/4] 数据输入完成：365天×144时段，所有功率已换算为kWh")
-    print(f"[2/4] 参数初始化完成：eta={p_global.eta_charge:.2f}, q_load={p_global.load_quantile:.2f}, q_pv={p_global.pv_quantile:.2f}")
+    dynamic_cfg = DynamicQuantileParameters()
+    print(
+        "[2/4] 参数初始化完成："
+        f"eta={p_global.eta_charge:.2f}, "
+        f"日前净负荷分位数候选={dynamic_cfg.candidates[0]:.2f}—{dynamic_cfg.candidates[-1]:.2f}, "
+        f"验证窗={dynamic_cfg.validation_days}天"
+    )
     print(f"[3/4] 模型调用完成：{len(all_frame):,}条逐时段结果")
 
     if args.smoke:
@@ -973,6 +1094,8 @@ def main() -> None:
     notes = write_notes(p_global, daily, checks, voi_value)
     summary_payload = {
         "parameters": asdict(p_global),
+        "dynamic_quantile_parameters": asdict(DynamicQuantileParameters()),
+        "dynamic_quantile_coverage": ["问题2_固定价", "问题4-2_波动价"],
         "checks": checks,
         "voi_yuan": voi_value,
         "elapsed_seconds": time.perf_counter() - tic,

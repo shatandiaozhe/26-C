@@ -169,19 +169,6 @@ def run_sensitivity() -> dict:
         }
         output["储能效率"][label] = {name: summarize_scenario(frame) for name, frame in frames.items()}
 
-    quantile_cases = {
-        "较激进_qL0.72_qPV0.22": replace(baseline, load_quantile=0.72, pv_quantile=0.22),
-        "基准_qL0.80_qPV0.20": baseline,
-        "较保守_qL0.88_qPV0.18": replace(baseline, load_quantile=0.88, pv_quantile=0.18),
-    }
-    output["日前分位数"] = {}
-    for label, params in quantile_cases.items():
-        data = solver.load_inputs(params)
-        frames = {
-            "问题2_固定价": solver.solve_day_ahead(data, params, "fixed", 365),
-            "问题4-2_波动价": solver.solve_day_ahead(data, params, "variable", 365),
-        }
-        output["日前分位数"][label] = {name: summarize_scenario(frame) for name, frame in frames.items()}
     return output
 
 
@@ -213,6 +200,22 @@ def main() -> None:
         .sum()
     )
     representative = daily[daily["日期"].isin(representative_dates)].copy()
+    dynamic_selection = {}
+    for name in ("问题2_固定价", "问题4-2_波动价"):
+        choices = (
+            interval[interval["策略"] == name]
+            .groupby("日期", as_index=False)["选择净负荷分位数"]
+            .first()["选择净负荷分位数"]
+        )
+        dynamic_selection[name] = {
+            "分位数均值": float(choices.mean()),
+            "分位数中位数": float(choices.median()),
+            "分位数变更次数": int((choices.diff().abs() > TOL).sum()),
+            "各分位数天数": {
+                f"{alpha:.2f}": int(count)
+                for alpha, count in choices.value_counts().sort_index().items()
+            },
+        }
     payload = {
         "统计口径": {
             "开始日期": START.isoformat(),
@@ -228,6 +231,7 @@ def main() -> None:
         "策略统计": stats,
         "月度汇总": monthly.to_dict(orient="records"),
         "代表日汇总": representative.to_dict(orient="records"),
+        "动态净负荷分位数": dynamic_selection,
         "成对比较": {
             "固定价滚动相对日前": paired_comparison(daily, "问题2_固定价", "问题3_固定价"),
             "波动价滚动相对日前": paired_comparison(daily, "问题4-2_波动价", "问题4-3_波动价"),
@@ -251,7 +255,8 @@ def main() -> None:
         },
         "紧急电价倍数敏感性": {},
         "重算敏感性": run_sensitivity(),
-        "基准参数": asdict(solver.Parameters()),
+        "模型参数": asdict(solver.Parameters()),
+        "动态分位数参数": asdict(solver.DynamicQuantileParameters()),
     }
 
     for multiplier in (4.5, 5.0, 5.5):

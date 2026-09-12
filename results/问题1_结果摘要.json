@@ -17,6 +17,6 @@
   "max_balance_residual_kWh": 2.2737367544323206e-13,
   "max_soc_residual_kWh": 8.313350008393172e-13,
   "simultaneous_charge_discharge_periods": 0,
-  "solve_seconds": 0.06465929999831133,
+  "solve_seconds": 0.0495310000005702,
   "stage1_optimal_cost_yuan": 35126.94858928963
 }
